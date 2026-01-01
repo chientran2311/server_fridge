@@ -1,23 +1,17 @@
-require('dotenv').config(); // Load biến môi trường
+require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// --- 1. CẤU HÌNH FIREBASE ADMIN ---
-// Kỹ thuật này giúp bạn không bao giờ lộ file JSON lên Git.
-// Khi deploy lên Render, ta sẽ nhét toàn bộ nội dung file JSON vào biến môi trường.
-
+// --- 1. SETUP FIREBASE ADMIN ---
 let serviceAccount;
 
+// Tự động nhận diện môi trường (Render hay Local)
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  // Trường hợp chạy trên Render (Server thật)
-  // Biến môi trường chứa chuỗi JSON -> Parse ra Object
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 } else {
-  // Trường hợp chạy Local (Máy tính của bạn)
-  // Đọc file trực tiếp
   serviceAccount = require('./serviceAccountKey.json');
 }
 
@@ -27,83 +21,120 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// --- 2. API ENDPOINT (Cron-job sẽ gọi vào đây) ---
+// --- 2. API QUÉT HẾT HẠN (CRON-JOB GỌI VÀO ĐÂY) ---
 app.get('/check-expiry', async (req, res) => {
   
-  // [BẢO MẬT] Kiểm tra Secret Key để tránh người lạ gọi API spam
+  // [BẢO MẬT] Kiểm tra mã bí mật từ Cron-job
   const secretKey = req.headers['x-cron-secret'];
   if (secretKey !== process.env.CRON_SECRET) {
-    return res.status(401).send('Unauthorized: Sai mật khẩu Cron!');
+    return res.status(401).send('Unauthorized: Sai mã bí mật!');
   }
 
   try {
     console.log('🔄 Bắt đầu quét các món sắp hết hạn...');
-    const messages = [];
-    
-    // --- LOGIC TÌM HÀNG HẾT HẠN ---
-    // Ví dụ: Tìm các món hết hạn TRONG NGÀY MAI
-    const today = new Date();
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    
-    // Convert sang định dạng lưu trong Firestore (cần khớp với cách bạn lưu ở App)
-    // Giả sử bạn lưu dạng Timestamp hoặc String YYYY-MM-DD. 
-    // Ở đây tôi giả định bạn lưu Timestamp. Logic này bạn cần chỉnh lại cho khớp App nhé.
-    const startOfTomorrow = new Date(tomorrow.setHours(0,0,0,0));
-    const endOfTomorrow = new Date(tomorrow.setHours(23,59,59,999));
 
-    // Query vào Collection chứa đồ ăn (Ví dụ: 'inventory_items')
-    const snapshot = await db.collection('households')
-        // Lưu ý: Logic query Group hoặc lặp qua từng household tùy cấu trúc DB của bạn
-        // Để đơn giản, tôi giả dụ bạn có collection riêng hoặc query group
-        // Tạm thời query mẫu, bạn cần chỉnh sửa 'collection path' cho đúng
-        .get(); 
+    // --- A. TÍNH TOÁN THỜI GIAN (NGÀY MAI) ---
+    // Món 'inv_01' trong seeder của bạn hết hạn sau 1 ngày -> Sẽ rơi vào khoảng này
+    const now = new Date();
+    const tomorrowStart = new Date(now);
+    tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+    tomorrowStart.setHours(0, 0, 0, 0);
 
-    // *LƯU Ý QUAN TRỌNG VỚI MOBILE DEV*: 
-    // Backend không có Context User, nên bạn phải tự query data chính xác.
-    // Nếu data bạn nằm lồng nhau: households/{id}/items/{itemId}, bạn nên dùng CollectionGroup query.
+    const tomorrowEnd = new Date(tomorrowStart);
+    tomorrowEnd.setHours(23, 59, 59, 999);
 
-    // CODE GIẢ LẬP GỬI THÔNG BÁO (Demo)
-    // Thực tế bạn sẽ loop qua snapshot.docs để lấy token
-    
-    // Giả sử tìm được 1 user cần báo
-    const userFcmToken = "TOKEN_CUA_USER_LAY_TU_DB"; 
-    
-    if (userFcmToken) {
-      const message = {
-        notification: {
-          title: 'Cảnh báo hết hạn! 🍎',
-          body: 'Sữa tươi của bạn sẽ hết hạn vào ngày mai. Nấu ngay nhé!',
-        },
-        data: {
-          screen: '/recipe_suggestions', // Deep link để Flutter hứng
-          ingredient: 'Sữa tươi'
-        },
-        token: userFcmToken,
-      };
-      
-      // Gửi đi
-      await admin.messaging().send(message);
-      messages.push(message);
+    console.log(`🔎 Tìm món hết hạn từ: ${tomorrowStart.toISOString()} đến ${tomorrowEnd.toISOString()}`);
+
+    // --- B. QUERY FIRESTORE (COLLECTION GROUP) ---
+    // Dùng collectionGroup('inventory') để quét xuyên qua tất cả các households
+    // Khớp với cấu trúc: households/{id}/inventory/{itemId}
+    const snapshot = await db.collectionGroup('inventory')
+      .where('expiry_date', '>=', tomorrowStart)
+      .where('expiry_date', '<=', tomorrowEnd)
+      .get();
+
+    if (snapshot.empty) {
+      console.log('✅ Không có món nào hết hạn vào ngày mai.');
+      return res.status(200).send('No items expiring tomorrow.');
     }
 
-    res.status(200).json({ 
-      success: true, 
-      processed: messages.length, 
-      message: 'Đã quét và gửi thông báo xong!' 
+    console.log(`📦 Tìm thấy ${snapshot.size} món sắp hết hạn.`);
+    let sentCount = 0;
+
+    // --- C. XỬ LÝ GỬI THÔNG BÁO ---
+    for (const doc of snapshot.docs) {
+      const itemData = doc.data();
+      
+      // Lấy thông tin từ Seeder: 'name' và 'household_id'
+      const itemName = itemData.name || 'Món ăn';
+      const householdId = itemData.household_id;
+
+      if (!householdId) continue;
+
+      // 1. Lấy thông tin Household để tìm Members
+      const houseDoc = await db.collection('households').doc(householdId).get();
+      
+      if (houseDoc.exists) {
+        // Seeder: members là mảng UID ['user_seed_01', ...]
+        const members = houseDoc.data().members || [];
+        
+        // 2. Lặp qua từng thành viên để lấy Token
+        for (const uid of members) {
+          const userDoc = await db.collection('users').doc(uid).get();
+          
+          if (userDoc.exists) {
+            // Seeder: fcm_token nằm trong users
+            const userData = userDoc.data();
+            const fcmToken = userData.fcm_token;
+
+            // Chỉ gửi nếu có Token (User đã đăng nhập App)
+            if (fcmToken && fcmToken.length > 10) {
+              
+              const message = {
+                notification: {
+                  title: 'Cảnh báo hết hạn! ⏳',
+                  body: `"${itemName}" sẽ hết hạn vào ngày mai. Nấu món gì đó ngay nhé!`,
+                },
+                // Data để App Flutter hứng và Deep Link
+                data: {
+                  screen: '/recipe_suggestions', 
+                  ingredient: itemName // Truyền tên món (VD: Thịt bò) để gợi ý công thức
+                },
+                token: fcmToken,
+              };
+
+              try {
+                await admin.messaging().send(message);
+                console.log(`📲 Đã gửi FCM tới User: ${uid} (Món: ${itemName})`);
+                sentCount++;
+              } catch (err) {
+                console.error(`❌ Lỗi gửi tin tới ${uid}:`, err.message);
+                // Nếu lỗi "Registration token not registered", nên xóa token khỏi DB
+              }
+            } else {
+              console.log(`⚠️ User ${uid} chưa có FCM Token (Chưa login app trên máy thật).`);
+            }
+          }
+        }
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Đã xử lý xong. Gửi thành công ${sentCount} thông báo.`,
     });
 
   } catch (error) {
-    console.error('Lỗi:', error);
+    console.error('🔥 Lỗi Server:', error);
     res.status(500).send('Internal Server Error: ' + error.message);
   }
 });
 
-// --- 3. API TEST (Để biết server sống) ---
+// Trang chủ để biết Server còn sống
 app.get('/', (req, res) => {
-  res.send('Notification Server is running! 🚀');
+  res.send('Notification Server is LIVE! 🚀');
 });
 
 app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
+  console.log(`Server is running on port ${port}`);
 });
