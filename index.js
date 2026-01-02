@@ -20,7 +20,7 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// --- 2. API QUÉT HẾT HẠN (CRON-JOB GỌI VÀO ĐÂY) ---
+// --- 2. API QUÉT HẾT HẠN ---
 app.get('/check-expiry', async (req, res) => {
   
   const secretKey = req.headers['x-cron-secret'];
@@ -31,6 +31,7 @@ app.get('/check-expiry', async (req, res) => {
   try {
     console.log('🔄 Bắt đầu quét các món sắp hết hạn...');
 
+    // 1. Xác định khung giờ ngày mai
     const now = new Date();
     const tomorrowStart = new Date(now);
     tomorrowStart.setDate(tomorrowStart.getDate() + 1);
@@ -39,8 +40,9 @@ app.get('/check-expiry', async (req, res) => {
     const tomorrowEnd = new Date(tomorrowStart);
     tomorrowEnd.setHours(23, 59, 59, 999);
 
-    console.log(`🔎 Tìm món hết hạn từ: ${tomorrowStart.toISOString()} đến ${tomorrowEnd.toISOString()}`);
+    console.log(`🔎 Tìm từ: ${tomorrowStart.toISOString()} đến ${tomorrowEnd.toISOString()}`);
 
+    // 2. Query tìm món ăn
     const snapshot = await db.collectionGroup('inventory')
       .where('expiry_date', '>=', tomorrowStart)
       .where('expiry_date', '<=', tomorrowEnd)
@@ -52,60 +54,97 @@ app.get('/check-expiry', async (req, res) => {
     }
 
     console.log(`📦 Tìm thấy ${snapshot.size} món sắp hết hạn.`);
-    let sentCount = 0;
+
+    // --- LOGIC GOM NHÓM (NEW) ---
+    // Cấu trúc Map: { userId: { token:String, items: [String] } }
+    const userNotifications = {}; 
 
     for (const doc of snapshot.docs) {
       const itemData = doc.data();
       const itemName = itemData.name || 'Món ăn';
       const householdId = itemData.household_id;
 
-      if (!householdId) continue;
+      if (!householdId) continue; // Bỏ qua nếu món lỗi data
 
+      // Lấy thông tin Household để tìm Members
       const houseDoc = await db.collection('households').doc(householdId).get();
       
       if (houseDoc.exists) {
         const members = houseDoc.data().members || [];
         
+        // Lặp qua từng thành viên trong nhà
         for (const uid of members) {
-          const userDoc = await db.collection('users').doc(uid).get();
-          
-          if (userDoc.exists) {
-            const userData = userDoc.data();
-            const fcmToken = userData.fcm_token; // Lưu ý: Code Mobile đang lưu là fcm_token (snake_case)
-
-            if (fcmToken && fcmToken.length > 10) {
+          // Nếu user này chưa có trong danh sách gửi, thì fetch token
+          if (!userNotifications[uid]) {
+            const userDoc = await db.collection('users').doc(uid).get();
+            if (userDoc.exists) {
+              const userData = userDoc.data();
+              const token = userData.fcm_token;
               
-              const message = {
-                notification: {
-                  title: 'Cảnh báo hết hạn! ⏳',
-                  body: `"${itemName}" sẽ hết hạn vào ngày mai. Nấu món gì đó ngay nhé!`,
-                },
-                // [CẬP NHẬT QUAN TRỌNG] Gửi dữ liệu điều hướng chuẩn
-                data: {
-                  action_id: 'FIND_RECIPE',  // Định danh hành động
-                  ingredient: itemName       // Tên nguyên liệu cần tìm
-                },
-                token: fcmToken,
-              };
-
-              try {
-                await admin.messaging().send(message);
-                console.log(`📲 Đã gửi FCM tới User: ${uid} (Món: ${itemName})`);
-                sentCount++;
-              } catch (err) {
-                console.error(`❌ Lỗi gửi tin tới ${uid}:`, err.message);
+              if (token && token.length > 10) {
+                userNotifications[uid] = {
+                  token: token,
+                  items: [] 
+                };
               }
-            } else {
-              console.log(`⚠️ User ${uid} chưa có FCM Token.`);
             }
+          }
+
+          // Nếu user đã tồn tại (và có token), thêm món ăn vào danh sách của họ
+          if (userNotifications[uid]) {
+            userNotifications[uid].items.push(itemName);
           }
         }
       }
     }
 
+    // --- GỬI THÔNG BÁO (Sau khi đã gom nhóm) ---
+    let sentCount = 0;
+    const userIds = Object.keys(userNotifications);
+    console.log(`📨 Chuẩn bị gửi cho ${userIds.length} users.`);
+
+    for (const uid of userIds) {
+      const data = userNotifications[uid];
+      const items = data.items; // List tên các món: ['Thịt bò', 'Sữa', 'Trứng']
+      const firstItem = items[0];
+      const otherCount = items.length - 1;
+
+      // Tạo nội dung thông báo thông minh
+      let title = 'Cảnh báo hết hạn! ⏳';
+      let body = '';
+
+      if (items.length === 1) {
+        body = `"${firstItem}" sẽ hết hạn vào ngày mai. Nấu món gì đó ngay nhé!`;
+      } else {
+        body = `"${firstItem}" và ${otherCount} món khác sẽ hết hạn vào ngày mai. Kiểm tra tủ lạnh ngay!`;
+      }
+
+      // Payload gửi đi
+      const message = {
+        notification: {
+          title: title,
+          body: body,
+        },
+        data: {
+          action_id: 'FIND_RECIPE',
+          // Gửi tên món đầu tiên để App gợi ý công thức cho món đó
+          ingredient: firstItem 
+        },
+        token: data.token,
+      };
+
+      try {
+        await admin.messaging().send(message);
+        console.log(`✅ Sent to ${uid}: ${body}`);
+        sentCount++;
+      } catch (err) {
+        console.error(`❌ Fail to send ${uid}:`, err.message);
+      }
+    }
+
     res.status(200).json({
       success: true,
-      message: `Đã xử lý xong. Gửi thành công ${sentCount} thông báo.`,
+      message: `Đã xử lý xong. Gửi thành công tới ${sentCount} users.`,
     });
 
   } catch (error) {
@@ -115,7 +154,7 @@ app.get('/check-expiry', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('Notification Server is LIVE! 🚀');
+  res.send('Notification Server is LIVE (Grouped Mode)! 🚀');
 });
 
 app.listen(port, () => {
