@@ -128,10 +128,11 @@ app.get('/check-expiry', async (req, res) => {
 
     for (const uid of userIds) {
       const data = userNotifications[uid];
-      const items = data.items; 
+      const items = data.items; // VD: ['Thịt bò', 'Trứng gà']
       const firstItem = items[0];
       const otherCount = items.length - 1;
 
+      // 1. Tạo nội dung thông báo (Body) - Giữ nguyên logic hiển thị đẹp
       let title = 'Cảnh báo hết hạn! ⏳';
       let body = '';
 
@@ -141,18 +142,23 @@ app.get('/check-expiry', async (req, res) => {
         body = `"${firstItem}" và ${otherCount} món khác sẽ hết hạn vào ngày mai.`;
       }
 
+      // 2. [CẬP NHẬT] Tạo chuỗi danh sách nguyên liệu
+      // Nối các món lại bằng dấu phẩy: "Thịt bò,Trứng gà"
+      const allIngredientsString = items.join(',');
+
       const message = {
         notification: { title: title, body: body },
         data: {
           action_id: 'FIND_RECIPE',
-          ingredient: firstItem 
+          // Gửi chuỗi danh sách thay vì chỉ 1 món
+          ingredients_list: allIngredientsString 
         },
         token: data.token,
       };
 
       try {
         await admin.messaging().send(message);
-        console.log(`✅ Đã gửi tới ${uid}: ${body}`);
+        console.log(`✅ Đã gửi tới ${uid}: [${allIngredientsString}]`);
         sentCount++;
       } catch (err) {
         console.error(`❌ Gửi thất bại tới ${uid}:`, err.message);
